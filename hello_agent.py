@@ -29,6 +29,7 @@ import json                        # 模型返回的工具参数是 JSON 字符�
 from openai import OpenAI          # OpenAI 官方库。DeepSeek 兼容它的格式，所以直接复用
 from dotenv import load_dotenv     # 用来读取 .env 文件里的配置
 import datetime
+import inspect            # ← 新增
 # load_dotenv() 会去当前目录找 .env 文件，把里面的 DEEPSEEK_API_KEY=xxx
 # 加载成环境变量。之后 os.getenv() 才读得到。
 #
@@ -44,6 +45,54 @@ client = OpenAI(
     base_url="https://api.deepseek.com",
 )
 
+# ==============================================================================
+# 工具注册机制：用 @tool 装饰器自动生成 JSON 描述并登记
+# ==============================================================================
+
+TOOL_SCHEMAS = []      # 给模型看的"工具说明书"列表
+TOOL_MAP = {}          # 执行时用的"名字 → 函数"映射
+
+TYPE_MAP = {
+    str: "string",
+    int: "integer",
+    float: "number",
+    bool: "boolean",
+}
+
+
+def tool(func):
+    """把一个函数注册成 Agent 可用的工具"""
+    name = func.__name__
+    description = func.__doc__ or ""
+
+    sig = inspect.signature(func)
+    properties = {}
+    required = []
+
+    for param_name, param in sig.parameters.items():
+        json_type = TYPE_MAP.get(param.annotation, "string")
+        properties[param_name] = {"type": json_type}
+        if param.default is inspect.Parameter.empty:
+            required.append(param_name)
+
+    TOOL_SCHEMAS.append({
+        "type": "function",
+        "function": {
+            "name": name,
+            "description": description,
+            "parameters": {
+                "type": "object",
+                "properties": properties,
+                "required": required,
+            },
+        },
+    })
+
+    TOOL_MAP[name] = func          # ← 新增！顺手注册映射，tool_map 也不用写了
+
+    return func
+
+
 
 
 # ==============================================================================
@@ -52,8 +101,8 @@ client = OpenAI(
 #
 # 这些就是普通函数，没有任何魔法。模型不会直接执行它们——
 # 是【我们的代码】执行它们，然后把结果告诉模型。这点必须先想清楚。
-
-def get_weather(city):
+@tool
+def get_weather(city: str):
     """查询城市天气（这里用假数据，真实项目里会去调天气 API）"""
     # 这是个字典 dict：用 "键" 找 "值"，类似 Java 的 Map
     data = {
@@ -65,8 +114,8 @@ def get_weather(city):
     # f"..." 是 f-string，把变量 {city} 直接嵌进字符串里
     return data.get(city, f"{city}：暂无数据")
 
-
-def calculate(expression):
+@tool
+def calculate(expression: str):
     """计算数学表达式"""
     # try/except 是"出错也不崩"的写法：
     #   try    里出错 → 跳到 except，而不是让整个程序挂掉
@@ -80,89 +129,15 @@ def calculate(expression):
     except Exception as e:
         return f"算错了：{e}"
 
+@tool
 def get_time():
     """返回当前时间"""
-    return datetime.datetime.now().strftime("%Y-%m-%d %Hh:%M:%S")
+    return datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
-# ==============================================================================
-# ② tools：告诉模型"你有哪些工具可以使用"
-# ==============================================================================
-#
-# 【这是整个 Agent 最反直觉的地方，务必理解】
-#
-# 模型根本看不到、也看不懂你的 Python 函数。它只收到一段文字。
-# 所以你必须【用自然语言 + JSON 格式】描述一遍你的工具有哪些、怎么用。
-#
-# 模型做的事情本质上是：
-#   "我读了这些工具描述，我觉得该用 get_weather，参数是 city=杭州"
-#   → 它返回这个【意图】，不是真的调用
-#   → 真正执行的是我们的 Python 代码
-#
-# 这个描述写得越清楚，模型选工具越准。description 别偷懒。
-
-tools = [
-    {
-        "type": "function",
-        "function": {
-            "name": "get_weather",                          # 必须和 Python 函数名对应
-            "description": "查询指定城市的天气",              # 这句话模型会读到
-            "parameters": {                                  # 参数的 JSON Schema 描述
-                "type": "object",
-                "properties": {
-                    "city": {
-                        "type": "string",
-                        "description": "城市名称，例如 北京",  # 给例子能显著提升准确率
-                    }
-                },
-                "required": ["city"],                        # 必填参数
-            },
-        },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "calculate",
-            "description": "计算一个数学表达式，例如 123 * 456",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "expression": {
-                        "type": "string",
-                        "description": "数学表达式",
-                    }
-                },
-                "required": ["expression"],
-            },
-        },
-    },
-{
-    "type": "function",
-    "function": {
-        "name": "get_time",
-        "description": "返回当前的日期和时间。当用户问'现在几点''今天几号'时使用",
-        "parameters": {
-            "type": "object",
-            "properties": {},        # 空字典 = 没有参数
-            "required": [],          # 空列表 = 没有必填
-        },
-    },
-},
-]
-
-# 工具名(字符串) → 函数对象 的映射表
-#
-# 为什么需要它？
-#   模型返回的是字符串 "get_weather"，但我们要执行的是【函数对象】get_weather。
-#   字符串和函数是两回事，所以需要一张表把名字翻译成真正的函数。
-#
-# 注意这里写的是 get_weather 而不是 get_weather()：
-#   不带括号 = 函数本身（存起来待用）
-#   带括号   = 立刻调用它
-tool_map = {
-    "get_weather": get_weather,
-    "calculate": calculate,
-    "get_time": get_time,
-}
+@tool
+def get_stock_price(code: str):
+    """查询股票价格"""
+    return f"{code}：100元"
 
 
 # ==============================================================================
@@ -186,7 +161,7 @@ def run_agent(user_input):
             "role": "system",
             # 这句话至关重要！它逼着模型去调工具而不是瞎编。
             # 去掉这句，模型很可能直接编一个"杭州今天晴，25度"出来。
-            "content": "你是一个有用的助手。需要查天气或算数时，必须调用工具，不许自己编答案。",
+            "content": "你是一个有用的助手。需要查天气或算数时或者查股票价格时，必须调用工具，不许自己编答案。",
         },
         {"role": "user", "content": user_input},
     ]
@@ -204,7 +179,7 @@ def run_agent(user_input):
         response = client.chat.completions.create(
             model="deepseek-chat",
             messages=messages,
-            tools=tools,
+            tools=TOOL_SCHEMAS,
         )
         # response 是个大对象，真正的回复藏在 choices[0].message 里
         msg = response.choices[0].message
@@ -230,7 +205,7 @@ def run_agent(user_input):
                 #   args = {"city": "杭州"}
                 #   get_weather(**args)  等价于  get_weather(city="杭州")
                 # 去掉 ** 就变成传一整个字典当第一个参数，会报错。
-                result = tool_map[name](**args)
+                result = TOOL_MAP[name](**args)      # ✅ 新名字
                 print(f"  工具返回: {result}")
 
                 # 把工具结果塞回对话历史，让模型在下一轮能看到
