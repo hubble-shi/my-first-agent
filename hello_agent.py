@@ -143,6 +143,15 @@ def get_stock_price(code: str):
 # ==============================================================================
 # ③ 主循环：Agent 的心脏
 # ==============================================================================
+# ★ 对话历史放在函数【外面】—— 这样它才活得比一次调用长
+#   整个程序运行期间只有这一份，每次对话都往同一份里追加
+MESSAGES = [
+    {
+        "role": "system",
+        # 这句话至关重要！它逼着模型去调工具而不是瞎编。
+        "content": "你是一个有用的助手。需要查天气或算数时或者查股票价格时，必须调用工具，不许自己编答案。",
+    },
+]
 
 def run_agent(user_input):
     """
@@ -151,20 +160,15 @@ def run_agent(user_input):
     messages 是整个对话历史。每一轮都把新消息 append 进去，
     模型每次看到的都是【完整历史】，所以它才有"记忆"。
     """
-    # 三个角色：
+# 三个角色：
     #   system    —— 设定模型的行为准则（最高优先级）
     #   user      —— 用户说的话
     #   assistant —— 模型说的话
     #   tool      —— 工具的执行结果（下面会遇到）
-    messages = [
-        {
-            "role": "system",
-            # 这句话至关重要！它逼着模型去调工具而不是瞎编。
-            # 去掉这句，模型很可能直接编一个"杭州今天晴，25度"出来。
-            "content": "你是一个有用的助手。需要查天气或算数时或者查股票价格时，必须调用工具，不许自己编答案。",
-        },
-        {"role": "user", "content": user_input},
-    ]
+    #
+    # ⚠️ 关键变化：不再【新建】一个列表，
+    #    而是往【外面那个】MESSAGES 里追加一条。
+    MESSAGES.append({"role": "user", "content": user_input})
 
     # range(5) = 最多循环 5 轮
     # 为什么要有上限？
@@ -178,7 +182,7 @@ def run_agent(user_input):
         # 模型才知道自己能用什么
         response = client.chat.completions.create(
             model="deepseek-chat",
-            messages=messages,
+            messages=MESSAGES,
             tools=TOOL_SCHEMAS,
         )
         # response 是个大对象，真正的回复藏在 choices[0].message 里
@@ -191,7 +195,8 @@ def run_agent(user_input):
         if msg.tool_calls:
             # 先把"模型想调工具"这个意图也存进历史。
             # 不存的话，后面塞工具结果时模型会对不上号、直接报错。
-            messages.append(msg)
+            MESSAGES.append(msg)
+
 
             for tool_call in msg.tool_calls:
                 name = tool_call.function.name       # 字符串，如 "get_weather"
@@ -209,7 +214,7 @@ def run_agent(user_input):
                 print(f"  工具返回: {result}")
 
                 # 把工具结果塞回对话历史，让模型在下一轮能看到
-                messages.append({
+                MESSAGES.append({
                     "role": "tool",                  # 角色是 tool，不是 user
                     "tool_call_id": tool_call.id,    # 告诉模型：这是你刚才那次调用的结果
                     "content": result,               # 必须是字符串！所以上面 calculate 用了 str()
