@@ -29,7 +29,7 @@ import json                        # 模型返回的工具参数是 JSON 字符�
 from openai import OpenAI          # OpenAI 官方库。DeepSeek 兼容它的格式，所以直接复用
 from dotenv import load_dotenv     # 用来读取 .env 文件里的配置
 import datetime
-import inspect            # ← 新增
+import inspect                     # 用来读取函数的参数结构（装饰器里要用）
 # load_dotenv() 会去当前目录找 .env 文件，把里面的 DEEPSEEK_API_KEY=xxx
 # 加载成环境变量。之后 os.getenv() 才读得到。
 #
@@ -106,7 +106,6 @@ def get_weather(city: str):
     """查询城市天气"""
     # 这是个字典 dict：用 "键" 找 "值"，类似 Java 的 Map
     data = {
-
         "北京": "晴，26度，微风",
         "上海": "多云，30度，湿度大",
         "杭州": "小雨，24度，记得带伞",
@@ -115,7 +114,7 @@ def get_weather(city: str):
     # f"..." 是 f-string，把变量 {city} 直接嵌进字符串
     return data.get(city, f"{city}：暂无数据")
 
-@tool  # pyright: ignore[reportUnreachable]
+@tool
 def calculate(expression: str):
     """计算数学表达式"""
     # try/except 是"出错也不崩"的写法：
@@ -206,7 +205,7 @@ def run_agent(user_input):
                 #   args = {"city": "杭州"}
                 #   get_weather(**args)  等价于  get_weather(city="杭州")
                 # 去掉 ** 就变成传一整个字典当第一个参数，会报错。
-                result = TOOL_MAP[name](**args)      # ✅ 新名字
+                result = TOOL_MAP[name](**args)      # 按名字找到函数并执行
                 print(f"  工具返回: {result}")
 
                 # 把工具结果塞回对话历史，让模型在下一轮能看到
