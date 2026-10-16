@@ -16,7 +16,7 @@
 
 按 ① ② ③ ④ 的顺序看，别从上往下硬读。
  ① 工具函数        —— 真正干活的代码
- ② tools 描述      —— 告诉模型有哪些工具（关键：模型看不懂 Python，只看得懂文字）
+ ② @tool 装饰器    —— 自动把函数翻译成"工具说明书"（关键：模型看不懂 Python，只看得懂文字）
  ③ 主循环          —— Agent 的心脏
  ④ __main__        —— 程序入口
 """
@@ -88,7 +88,7 @@ def tool(func):
         },
     })
 
-    TOOL_MAP[name] = func          # ← 新增！顺手注册映射，tool_map 也不用写了
+    TOOL_MAP[name] = func          # 顺手注册"名字 → 函数"映射，执行时靠它找到函数
 
     return func
 
@@ -103,18 +103,19 @@ def tool(func):
 # 是【我们的代码】执行它们，然后把结果告诉模型。这点必须先想清楚。
 @tool
 def get_weather(city: str):
-    """查询城市天气（这里用假数据，真实项目里会去调天气 API）"""
+    """查询城市天气"""
     # 这是个字典 dict：用 "键" 找 "值"，类似 Java 的 Map
     data = {
+
         "北京": "晴，26度，微风",
         "上海": "多云，30度，湿度大",
         "杭州": "小雨，24度，记得带伞",
     }
     # .get(键, 默认值)：找不到这个城市时返回默认值，不会报错
-    # f"..." 是 f-string，把变量 {city} 直接嵌进字符串里
+    # f"..." 是 f-string，把变量 {city} 直接嵌进字符串
     return data.get(city, f"{city}：暂无数据")
 
-@tool
+@tool  # pyright: ignore[reportUnreachable]
 def calculate(expression: str):
     """计算数学表达式"""
     # try/except 是"出错也不崩"的写法：
@@ -174,7 +175,7 @@ def run_agent(user_input):
     for turn in range(5):
         print(f"\n--- 第 {turn + 1} 轮 ---")
 
-        # 发请求给模型。注意 tools=tools —— 把工具清单一起发过去，
+        # 发请求给模型。注意 tools=TOOL_SCHEMAS —— 把工具清单一起发过去，
         # 模型才知道自己能用什么
         response = client.chat.completions.create(
             model="deepseek-chat",
