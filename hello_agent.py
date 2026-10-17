@@ -46,11 +46,9 @@ client = OpenAI(
 )
 
 # ==============================================================================
-# 工具注册机制：用 @tool 装饰器自动生成 JSON 描述并登记
+# 工具注册机制：@tool 只给函数贴一张说明书，不写任何全局表
 # ==============================================================================
 
-TOOL_SCHEMAS = []      # 给模型看的"工具说明书"列表
-TOOL_MAP = {}          # 执行时用的"名字 → 函数"映射
 
 TYPE_MAP = {
     str: "string",
@@ -75,7 +73,9 @@ def tool(func):
         if param.default is inspect.Parameter.empty:
             required.append(param_name)
 
-    TOOL_SCHEMAS.append({
+    # ★ 关键变化：不再往全局列表里塞，而是挂在函数自己身上
+    #   函数是对象，可以像这样给它加属性
+    func._schema = {
         "type": "function",
         "function": {
             "name": name,
@@ -86,9 +86,8 @@ def tool(func):
                 "required": required,
             },
         },
-    })
+    }
 
-    TOOL_MAP[name] = func          # 顺手注册"名字 → 函数"映射，执行时靠它找到函数
 
     return func
 
@@ -165,7 +164,7 @@ def get_stock_price(code: str):
 class Agent:
     """一个 Agent 实例：有自己的行为准则、自己的对话记忆"""
 
-    def __init__(self, system_prompt=None, max_turns=5):
+    def __init__(self, tools, system_prompt=None, max_turns=5):
         """
         __init__ 在【创建对象】时自动执行一次，负责装上初始状态。
         """
@@ -177,6 +176,15 @@ class Agent:
 
         self.system_prompt = system_prompt
         self.max_turns = max_turns
+
+        # ★ 这个 Agent 自己的工具（两样东西，各有用处）
+        #   self.tools   : 名字 -> 函数，执行工具时用
+        #   self.schemas : 说明书列表，发给模型看
+        self.tools = {}
+        self.schemas = []
+        for f in tools:
+            self.tools[f.__name__] = f
+            self.schemas.append(f._schema)
 
         # ★ 关键：每个 Agent 自己的记忆，从 system 那条开始
         #   注意是 self.messages，不是以前那个全局的 MESSAGES
@@ -208,12 +216,12 @@ class Agent:
         for turn in range(self.max_turns):
             print(f"\n--- 第 {turn + 1} 轮 ---")
 
-            # 发请求给模型。tools=TOOL_SCHEMAS 把工具清单一起发过去，
+            # 发请求给模型。tools=self.schemas 把工具清单一起发过去，
             # 模型才知道自己能用什么
             response = client.chat.completions.create(
                 model="deepseek-chat",
                 messages=self.messages,
-                tools=TOOL_SCHEMAS,
+                tools=self.schemas,
             )
             # response 是个大对象，真正的回复藏在 choices[0].message 里
             msg = response.choices[0].message
@@ -239,7 +247,7 @@ class Agent:
                     #   args = {"city": "杭州"}
                     #   get_weather(**args)  等价于  get_weather(city="杭州")
                     # 去掉 ** 就变成传一整个字典当第一个参数，会报错。
-                    result = TOOL_MAP[name](**args)      # 按名字找到函数并执行
+                    result = self.tools[name](**args)      # 按名字找到函数并执行
                     print(f"  工具返回: {result}")
 
                     # 把工具结果塞回对话历史，让模型在下一轮能看到
@@ -281,7 +289,7 @@ class Agent:
 #   这是 Python 的标准写法，记住就行。
 if __name__ == "__main__":
     # ★ 新建一个 Agent 对象。这一行之后，agent 就带着自己的记忆了
-    agent = Agent()
+    agent = Agent(tools=[get_weather, calculate, get_time, get_stock_price])
 
     print("你的第一个 Agent 启动了，输入 q 退出\n")
 
