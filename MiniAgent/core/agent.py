@@ -60,15 +60,16 @@ def tool(func):
 class Agent:
     """一个 Agent 实例：有自己的行为准则、自己的对话记忆"""
 
-    def __init__(self, tools, system_prompt=None, max_turns=5):
+    def __init__(self, tools, system_prompt, max_turns=5):
         """
-        __init__ 在【创建对象】时自动执行一次，负责装上初始状态。
-        """
-        if system_prompt is None:
-            system_prompt = (
-                "你是一个有用的助手。需要查天气或算数时或者查股票价格时，"
-                "必须调用工具，不许自己编答案。"
-            )
+    __init__ 在【创建对象】时自动执行一次，负责装上初始状态。
+
+    tools          —— 这个 Agent 能用的工具列表
+    system_prompt  —— 这个 Agent 的角色（必填：框架不知道该给你什么角色）
+    max_turns      —— 最多循环几轮
+    """
+
+
 
         self.system_prompt = system_prompt
         self.max_turns = max_turns

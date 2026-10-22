@@ -14,6 +14,13 @@ assistant.py 的工具是"查东西"——查天气、算数。查错了大不�
 import os
 import subprocess
 from core.agent import tool
+SYSTEM_PROMPT = (
+    "你是一个编程助手，可以读写文件、执行命令。"
+    "所有文件操作都在 workspace 目录内进行。"
+    "执行命令前，先想清楚这条命令会做什么。"
+    "如果需要多步操作，一步一步来，每步都确认结果。"
+    "所有文件操作都在 workspace 目录内进行，path 直接写相对路径（如 hello.py），不要加 workspace/ 前缀。"
+)
 
 
 # ==============================================================================
@@ -93,7 +100,9 @@ def _decode(raw_bytes):
 
 @tool
 def read_file(path: str):
-    """读取指定文件的内容（最多返回前 200 行）"""
+    """读取文件内容。
+    path 是【相对 workspace 的路径】，例如 "test.txt"。
+    不要写 "workspace/" 前缀。最多返回前 200 行。"""
 
     # 第一步：安全检查。跑出 workspace 就拒绝
     full = _safe_path(path)
@@ -126,7 +135,10 @@ def read_file(path: str):
 
 @tool
 def write_file(path: str, content: str):
-    """把内容写入指定文件（会覆盖原内容）"""
+    """把内容写入文件（会覆盖原内容）。
+    path 是【相对 workspace 的路径】，例如 "hello.py"。
+    不要写 "workspace/" 前缀。"""
+
 
     full = _safe_path(path)
     if full is None:
