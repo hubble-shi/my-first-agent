@@ -15,11 +15,16 @@ import os
 import subprocess
 from core.agent import tool
 SYSTEM_PROMPT = (
-    "你是一个编程助手，可以读写文件、执行命令。"
-    "所有文件操作都在 workspace 目录内进行。"
-    "执行命令前，先想清楚这条命令会做什么。"
-    "如果需要多步操作，一步一步来，每步都确认结果。"
-    "所有文件操作都在 workspace 目录内进行，path 直接写相对路径（如 hello.py），不要加 workspace/ 前缀。"
+    "你是一个编程助手，可以读写文件、执行命令。\n"
+    "所有文件操作都在 workspace 目录内进行。\n"
+    "path 直接写相对路径（如 hello.py），不要加 workspace/ 前缀。\n"
+    "\n"
+    "【运行环境】\n"
+    "- 操作系统：Windows\n"
+    "- 命令行：cmd\n"
+    "- Python 命令：python（不是 python3，也不是 py）\n"
+    "- 执行命令前，先想清楚这条命令会做什么。\n"
+    "- 需要多步操作时，一步一步来，每步都确认结果。"
 )
 
 
