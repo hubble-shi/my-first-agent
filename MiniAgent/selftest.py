@@ -15,6 +15,8 @@ r"""
 
 import os
 import sys
+import json
+
 
 from apps.coding_agent import read_file, write_file, run_command
 from apps.coding_agent import WORKSPACE, MAX_READ_LINES
@@ -188,6 +190,64 @@ section("14. run_command —— cwd 是否在 workspace")
 
 r = run_command("cd")
 check("命令在 workspace 里执行", "workspace" in r.lower(), r)
+
+# ---------------------------------------------------------------- 6.1 / 6.2 补测
+
+section("15. 日志模块（6.2）")
+
+import glob
+from core.logger import log_event, LOG_DIR
+
+log_event("selftest_marker", note="hello")
+
+files = glob.glob(os.path.join(LOG_DIR, "*.jsonl"))
+check("日志文件已生成", len(files) > 0, files)
+
+last_line = open(sorted(files)[-1], encoding="utf-8").read().strip().splitlines()[-1]
+try:
+    last_record = json.loads(last_line)
+    check("最后一行是合法 JSON", True)
+except Exception as e:
+    last_record = {}
+    check("最后一行是合法 JSON", False, str(e))
+
+check("最后一条是 selftest_marker", last_record.get("event") == "selftest_marker", last_record)
+
+
+section("16. 重试逻辑（6.1）")
+
+from core.retry import call_with_retry, is_retryable
+
+# 用 base_delay=0 跑，只测逻辑不测等待，否则自检会多花 3 秒
+counter = {"n": 0}
+
+
+def flaky():
+    counter["n"] += 1
+    if counter["n"] < 3:
+        raise ConnectionError("假的网络错误")
+    return "ok"
+
+
+check("失败 2 次后成功", call_with_retry(flaky, max_retries=2, base_delay=0) == "ok", counter["n"])
+check("总共调用了 3 次（1 次正常 + 2 次重试）", counter["n"] == 3, counter["n"])
+
+
+def always_fail():
+    raise ConnectionError("一直失败")
+
+
+try:
+    call_with_retry(always_fail, max_retries=1, base_delay=0)
+    check("重试用完后会抛出", False, "没有抛异常")
+except ConnectionError:
+    check("重试用完后会抛出", True)
+
+
+check("ConnectionError 判定为可重试", is_retryable(ConnectionError("x")) is True)
+check("ValueError 判定为不可重试", is_retryable(ValueError("x")) is False)
+
+
 
 
 # ---------------------------------------------------------------- 收尾
