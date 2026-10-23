@@ -3,7 +3,7 @@ import json                        # 模型返回的工具参数是 JSON 字符�
 from openai import OpenAI          # OpenAI 官方库。DeepSeek 兼容它的格式，所以直接复用
 from dotenv import load_dotenv     # 用来读取 .env 文件里的配置
 import inspect                     # 用来读取函数的参数结构（装饰器里要用）
-
+from core.retry import call_with_retry
 
 load_dotenv()
 
@@ -14,7 +14,7 @@ client = OpenAI(
     api_key=os.getenv("DEEPSEEK_API_KEY"),
     base_url="https://api.deepseek.com",
 )
-
+#1"https://api.deepseek.com"
 TYPE_MAP = {
     str: "string",
     int: "integer",
@@ -113,13 +113,14 @@ class Agent:
         for turn in range(self.max_turns):
             print(f"\n--- 第 {turn + 1} 轮 ---")
 
-            # 发请求给模型。tools=self.schemas 把工具清单一起发过去，
-            # 模型才知道自己能用什么
-            response = client.chat.completions.create(
-                model="deepseek-chat",
-                messages=self.messages,
-                tools=self.schemas,
+            response = call_with_retry(
+                lambda: client.chat.completions.create(
+                    model="deepseek-chat",
+                    messages=self.messages,
+                    tools=self.schemas,
+                )
             )
+
             # response 是个大对象，真正的回复藏在 choices[0].message 里
             msg = response.choices[0].message
 
