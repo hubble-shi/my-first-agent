@@ -43,7 +43,7 @@ BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 WORKSPACE = os.path.join(BASE_DIR, "workspace")
 
 # 读文件最多返回多少行（防止一个大日志文件撑爆上下文）
-MAX_READ_LINES = 50
+MAX_READ_LINES = 200
 
 # 命令输出最多返回多少字符（同上）
 MAX_OUTPUT_CHARS = 2000
