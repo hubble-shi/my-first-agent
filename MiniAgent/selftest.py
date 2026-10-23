@@ -158,6 +158,23 @@ section("12. run_command —— 超时")
 
 r = run_command("ping 127.0.0.1 -n 30")
 check("超时被捕获，没崩", "超时" in r, r[:60])
+section("12.5 run_command —— 危险命令拦截 ★")
+
+r = run_command("del /s /q x")
+check("del /s 被拒绝", "拒绝" in r, r)
+
+r = run_command("DEL  /S  /Q x")
+check("大写+多空格也拦得住", "拒绝" in r, r)
+
+r = run_command("del/s/q x")
+check("紧凑写法也拦得住", "拒绝" in r, r)
+
+r = run_command("format c:")
+check("format 被拒绝", "拒绝" in r, r)
+
+r = run_command("dir")
+check("正常命令不被误杀", "拒绝" not in r, r)
+
 
 
 section("13. 串联：写文件 → 执行它 ★★")

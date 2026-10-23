@@ -14,6 +14,8 @@ assistant.py 的工具是"查东西"——查天气、算数。查错了大不�
 import os
 import subprocess
 from core.agent import tool
+from core.logger import log_event
+
 SYSTEM_PROMPT = (
     "你是一个编程助手，可以读写文件、执行命令。\n"
     "所有文件操作都在 workspace 目录内进行。\n"
@@ -48,6 +50,22 @@ MAX_OUTPUT_CHARS = 2000
 
 # 命令最多跑多少秒（防止 ping 这种卡死）
 TIMEOUT = 15
+
+# 危险命令黑名单（归一化后做子串匹配）
+# ⚠️ 这只是"减速带"，不是"墙" —— 详见 README 里的安全说明
+DANGEROUS_PATTERNS = (
+    "format",        # 格式化磁盘
+    "del ",          # 删除
+    "erase ",        # 删除（另一种写法）
+    "rmdir",         # 删目录
+    "rd ",           # 删目录（简写）
+    "shutdown",      # 关机
+    "taskkill",      # 杀进程
+    "reg delete",    # 删注册表
+    "bcdedit",       # 改启动配置
+    "diskpart",      # 磁盘分区
+)
+
 
 
 # ==============================================================================
@@ -96,6 +114,31 @@ def _decode(raw_bytes):
         except UnicodeDecodeError:
             continue
     return raw_bytes.decode("utf-8", errors="replace")
+
+def _normalize_command(cmd: str) -> str:
+    """
+    把命令归一化，防止各种写法绕过黑名单。
+
+    'DEL  /S  /Q x'  ->  'del / s / q x'
+    'del/s/q x'      ->  'del / s / q x'
+
+    注意：只用于匹配，不影响实际执行的命令。
+    """
+    n = cmd.lower().replace("/", " / ")
+    return " ".join(n.split())
+
+
+def _check_command(cmd: str):
+    """
+    检查命令是否危险。
+    返回命中的危险模式；安全返回 None。
+    """
+    n = _normalize_command(cmd)
+    for p in DANGEROUS_PATTERNS:
+        if p in n:
+            return p.strip()
+    return None
+
 
 
 # ==============================================================================
@@ -178,6 +221,16 @@ def write_file(path: str, content: str):
 @tool
 def run_command(command: str):
     """在 workspace 目录下执行一条命令，返回输出"""
+
+    # ★ 第一步：安全检查。危险命令直接拒绝，不进入 subprocess
+    hit = _check_command(command)
+    if hit:
+        log_event("command_blocked", command=command, pattern=hit)
+        return (
+            f"拒绝执行：这条命令包含危险操作（{hit}）。"
+            "它会破坏系统或数据，我无法执行。"
+            "如果你确实需要，请自己手动操作。"
+        )
 
     try:
         r = subprocess.run(
