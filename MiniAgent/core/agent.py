@@ -4,6 +4,7 @@ from openai import OpenAI          # OpenAI 官方库。DeepSeek 兼容它的格
 from dotenv import load_dotenv     # 用来读取 .env 文件里的配置
 import inspect                     # 用来读取函数的参数结构（装饰器里要用）
 from core.retry import call_with_retry
+from core.logger import log_event
 
 load_dotenv()
 
@@ -104,6 +105,8 @@ class Agent:
         #
         # ⚠️ 往【自己这个对象】的记忆里追加，不是往全局变量里
         self.messages.append({"role": "user", "content": user_input})
+        log_event("user_input", content=user_input)
+
 
         # self.max_turns = 最多循环几轮
         # 为什么要有上限？
@@ -140,6 +143,7 @@ class Agent:
                     # json.loads 把它转成 Python 字典：{"city": "杭州"}
                     args = json.loads(tool_call.function.arguments)
                     print(f"  模型要调工具: {name}({args})")
+                    log_event("tool_call", tool=name, args=args)
 
                     # 【关键行】**args 里的 ** 是"字典解包"
                     #   args = {"city": "杭州"}
@@ -147,6 +151,7 @@ class Agent:
                     # 去掉 ** 就变成传一整个字典当第一个参数，会报错。
                     result = self.tools[name](**args)      # 按名字找到函数并执行
                     print(f"  工具返回: {result}")
+                    log_event("tool_result", tool=name, result=str(result))
 
                     # 把工具结果塞回对话历史，让模型在下一轮能看到
                     self.messages.append({
@@ -167,7 +172,9 @@ class Agent:
             # ---- 分支 B：模型给出了最终答案 ---------------------------------
             # 走到这里说明 msg.tool_calls 是空的，模型认为信息够了，可以直接回答
             print(f"\n最终回答: {msg.content}")
+            log_event("final_answer", content=str(msg.content))
             return msg.content
 
         # 循环跑满还没返回，说明模型卡住了
+        log_event("max_turns_exceeded", max_turns=self.max_turns)
         return f"超过最大轮数了（{self.max_turns} 轮）"
