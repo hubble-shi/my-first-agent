@@ -1,262 +1,213 @@
-"""
-Coding Agent 的三个工具：读文件 / 写文件 / 执行命令
+"""Workspace tools created separately for each coding agent."""
 
-【这个文件和 assistant.py 的区别】
-
-assistant.py 的工具是"查东西"——查天气、算数。查错了大不了答案不对。
-这个文件的工具是"动东西"——读文件、写文件、跑命令。做错了会丢数据、会删代码。
-
-所以这个文件里多了两样东西：
-  ① 路径检查（_safe_path）—— 不许跑出 workspace 目录
-  ② 错误捕获（try/except）—— 出错了返回一句话，不许崩
-"""
-
+import codecs
+import itertools
+import ntpath
 import os
+import stat
 import subprocess
-from core.agent import tool
-from core.logger import log_event
+import sys
+import tempfile
+from pathlib import Path, PureWindowsPath
+
+from core.agent import ToolError, tool
 
 SYSTEM_PROMPT = (
-    "你是一个编程助手，可以读写文件、执行命令。\n"
-    "所有文件操作都在 workspace 目录内进行。\n"
-    "path 直接写相对路径（如 hello.py），不要加 workspace/ 前缀。\n"
-    "\n"
-    "【运行环境】\n"
-    "- 操作系统：Windows\n"
-    "- 命令行：cmd\n"
-    "- Python 命令：python（不是 python3，也不是 py）\n"
-    "- 执行命令前，先想清楚这条命令会做什么。\n"
-    "- 需要多步操作时，一步一步来，每步都确认结果。"
+    "你是编程助手。文件路径相对于工作区，使用 list_files 和 read_file 查看文件，"
+    "使用 write_file 写入完整文本。覆盖已有文件前先读内容，并通过终端获得用户确认。"
+    "如果注册了 run_python，可请求运行工作区里的 Python 脚本。"
+    "根据工具返回的实际结果汇报，尤其要区分成功、拒绝和失败。"
 )
 
-
-# ==============================================================================
-# 常量：三个"刹车"
-# ==============================================================================
-
-# __file__     = ...\MiniAgent\apps\coding_agent.py
-# dirname 一次  = ...\MiniAgent\apps
-# dirname 两次  = ...\MiniAgent
-BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-
-# ...\MiniAgent\workspace —— 所有文件操作都限制在这里
-WORKSPACE = os.path.join(BASE_DIR, "workspace")
-
-# 读文件最多返回多少行（防止一个大日志文件撑爆上下文）
-MAX_READ_LINES = 200
-
-# 命令输出最多返回多少字符（同上）
-MAX_OUTPUT_CHARS = 2000
-
-# 命令最多跑多少秒（防止 ping 这种卡死）
-TIMEOUT = 15
-
-# 危险命令黑名单（归一化后做子串匹配）
-# ⚠️ 这只是"减速带"，不是"墙" —— 详见 README 里的安全说明
-DANGEROUS_PATTERNS = (
-    "format",        # 格式化磁盘
-    "del ",          # 删除
-    "erase ",        # 删除（另一种写法）
-    "rmdir",         # 删目录
-    "rd ",           # 删目录（简写）
-    "shutdown",      # 关机
-    "taskkill",      # 杀进程
-    "reg delete",    # 删注册表
-    "bcdedit",       # 改启动配置
-    "diskpart",      # 磁盘分区
-)
+MAX_FILE_BYTES = 16 * 1024
+MAX_OUTPUT_BYTES = 4 * 1024
+MAX_LIST_ENTRIES = 100
+TIMEOUT_SECONDS = 15
+_is_windows_reserved = getattr(ntpath, "isreserved", lambda part: PureWindowsPath(part).is_reserved())
 
 
+def _workspace_path(root, path):
+    windows_path = PureWindowsPath(path)
+    relative = Path(path)
+    if (
+        not path or relative.anchor or windows_path.anchor or ":" in path
+        or any(ord(char) < 32 or 127 <= ord(char) < 160 for char in path)
+        or ".." in relative.parts or ".." in windows_path.parts
+        or any(part.endswith((" ", ".")) or _is_windows_reserved(part) for part in windows_path.parts)
+    ):
+        raise ToolError("请使用工作区内的相对路径。")
 
-# ==============================================================================
-# 内部辅助函数：不是工具，模型看不到，只给下面三个工具用
-# 名字前面加下划线 _ 是 Python 的约定，意思是"内部用的，别在外面调"
-# ==============================================================================
-
-
-def _safe_path(path):
-    """
-    把用户给的路径，变成 workspace 内的绝对路径。
-
-    返回：
-        合法的绝对路径 -> 返回那个路径
-        想跑到 workspace 外面 -> 返回 None（调用方据此拒绝）
-    """
-    # abspath 会把 ".." 和 "." 都算掉，得到干净的绝对路径
-    # 比如 join(WORKSPACE, "../../.env") 再 abspath
-    #   -> C:\Users\11192\agent-study\.env
-    full = os.path.abspath(os.path.join(WORKSPACE, path))
-
-    # startswith 后面加 os.sep（反斜杠）是关键：
-    #   不加的话，"...\MiniAgent\workspace_evil\x" 也会被认为是合法的
-    #   加了之后，必须正好以 "...\MiniAgent\workspace\" 开头才算
-    # 后面那个 `or full == WORKSPACE` 是为了允许访问 workspace 目录本身
-    if not full.startswith(WORKSPACE + os.sep) and full != WORKSPACE:
-        return None
-
-    return full
+    try:
+        target = (root / relative).resolve()
+    except (OSError, RuntimeError, ValueError) as exc:
+        raise ToolError("路径无法解析。") from exc
+    if not target.is_relative_to(root):
+        raise ToolError("路径指向工作区外。")
+    return target
 
 
-def _decode(raw_bytes):
-    """
-    把命令输出的 bytes 变成字符串。
+def _bounded_read(stream, limit, errors):
+    data = stream.read(limit + 1)
+    truncated = len(data) > limit
+    decoder = codecs.getincrementaldecoder("utf-8")(errors=errors)
+    text = decoder.decode(data[:limit], final=not truncated)
+    return text + (f"\n… 已截断至前 {limit} 字节。" if truncated else "")
 
-    【为什么要这么麻烦】
-    Windows 命令行输出是 GBK 编码，不是 UTF-8。
-    直接用 utf-8 解码会得到乱码，甚至让 subprocess 的后台线程崩掉，
-    导致 r.stderr 变成 None。
 
-    策略：先试 utf-8，失败再试 gbk，都不行就替换坏字符（不崩）。
-    """
-    for enc in ("utf-8", "gbk"):
+def _create_file(target, data):
+    created = None
+    try:
+        with target.open("xb") as file:
+            created = os.fstat(file.fileno())
+            file.write(data)
+    except (OSError, KeyboardInterrupt):
+        if created is not None:
+            try:
+                if os.path.samestat(created, target.lstat()):
+                    target.unlink()
+            except OSError:
+                pass
+        raise
+
+
+def _file_revision(info):
+    return (info.st_dev, info.st_ino, info.st_mode, info.st_size, info.st_mtime_ns, info.st_ctime_ns)
+
+
+def _check_file_unchanged(target, original):
+    try:
+        current = target.lstat()
+    except FileNotFoundError as exc:
+        raise ToolError("确认后发现文件已变动，请重新检查。") from exc
+    if target.resolve() != target or _file_revision(current) != _file_revision(original):
+        raise ToolError("确认后发现文件已变动，请重新检查。")
+
+
+def _write_text(target, data, approve_overwrite):
+    target.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        _create_file(target, data)
+        return
+    except FileExistsError:
+        if approve_overwrite is None:
+            raise
+
+    original = target.lstat()
+    if not stat.S_ISREG(original.st_mode):
+        raise ToolError("只能覆盖工作区内的普通文件。")
+    if not approve_overwrite(target):
+        raise ToolError("用户拒绝覆盖文件。")
+    _check_file_unchanged(target, original)
+
+    staged = None
+    try:
+        with tempfile.NamedTemporaryFile(dir=target.parent, delete=False) as file:
+            staged = Path(file.name)
+            file.write(data)
+        if os.name == "posix":
+            staged.chmod(original.st_mode & 0o777)
+        _check_file_unchanged(target, original)
+        staged.replace(target)
+    finally:
+        if staged is not None:
+            staged.unlink(missing_ok=True)
+
+
+def build_tools(workspace, *, approve_overwrite=None, approve_python=None):
+    """Bind file tools to one workspace and optionally expose script execution."""
+    root = Path(workspace).resolve()
+
+    @tool
+    def list_files(path: str = "."):
+        """列出工作区内一个目录的直接子项，最多 100 项。"""
+        target = _workspace_path(root, path)
         try:
-            return raw_bytes.decode(enc)
-        except UnicodeDecodeError:
-            continue
-    return raw_bytes.decode("utf-8", errors="replace")
+            with os.scandir(target) as entries:
+                items = list(itertools.islice(entries, MAX_LIST_ENTRIES + 1))
+                names = [
+                    item.name + ("/" if item.is_dir(follow_symlinks=False) else "")
+                    for item in items[:MAX_LIST_ENTRIES]
+                ]
+        except OSError as exc:
+            raise ToolError("无法列出这个目录。") from exc
+        if len(items) > MAX_LIST_ENTRIES:
+            names.append("… 仅显示前 100 项。")
+        return "\n".join(names) or "目录为空。"
 
-def _normalize_command(cmd: str) -> str:
-    """
-    把命令归一化，防止各种写法绕过黑名单。
+    @tool
+    def read_file(path: str):
+        """读取工作区内的 UTF-8 文本文件，最多返回 16 KiB。"""
+        target = _workspace_path(root, path)
+        try:
+            if not target.is_file():
+                raise ToolError("只能读取工作区内的普通文件。")
+            with target.open("rb") as file:
+                return _bounded_read(file, MAX_FILE_BYTES, "strict")
+        except UnicodeDecodeError as exc:
+            raise ToolError("文件不是有效的 UTF-8 文本。") from exc
+        except OSError as exc:
+            raise ToolError("无法读取文件。") from exc
 
-    'DEL  /S  /Q x'  ->  'del / s / q x'
-    'del/s/q x'      ->  'del / s / q x'
+    @tool
+    def write_file(path: str, content: str, overwrite: bool = False):
+        """写入工作区文件，最多 16 KiB。覆盖已有文件须传 overwrite=true 并得到用户确认。"""
+        target = _workspace_path(root, path)
+        try:
+            if target == root or target.is_dir():
+                raise ToolError("请选择工作区内的文件路径。")
+            data = content.encode("utf-8")
+            if len(data) > MAX_FILE_BYTES:
+                raise ToolError("写入内容超过 16 KiB。")
+            _write_text(target, data, approve_overwrite if overwrite else None)
+        except FileExistsError as exc:
+            raise ToolError("文件已存在。请先读取，覆盖时须显式请求并经用户确认。") from exc
+        except (OSError, UnicodeEncodeError) as exc:
+            raise ToolError("无法写入文件。") from exc
+        return f"已写入 {path}（{len(data)} 字节）。"
 
-    注意：只用于匹配，不影响实际执行的命令。
-    """
-    n = cmd.lower().replace("/", " / ")
-    return " ".join(n.split())
+    tools = [list_files, read_file, write_file]
+    if approve_python is None:
+        return tools
+
+    @tool
+    def run_python(path: str):
+        """经用户确认后运行工作区内的 Python 脚本，限时 15 秒。"""
+        target = _workspace_path(root, path)
+        try:
+            original = target.lstat()
+            if target.suffix.lower() != ".py" or not stat.S_ISREG(original.st_mode):
+                raise ToolError("只能运行工作区内已存在的 .py 文件。")
+            if not approve_python(target):
+                raise ToolError("用户拒绝运行脚本。")
+            _check_file_unchanged(target, original)
+        except OSError as exc:
+            raise ToolError("无法检查待运行的脚本。") from exc
+        return _run_python(target, root)
+
+    return [*tools, run_python]
 
 
-def _check_command(cmd: str):
-    """
-    检查命令是否危险。
-    返回命中的危险模式；安全返回 None。
-    """
-    n = _normalize_command(cmd)
-    for p in DANGEROUS_PATTERNS:
-        if p in n:
-            return p.strip()
-    return None
-
-
-
-# ==============================================================================
-# 工具一：读文件
-# ==============================================================================
-
-
-@tool
-def read_file(path: str):
-    """读取文件内容。
-    path 是【相对 workspace 的路径】，例如 "test.txt"。
-    不要写 "workspace/" 前缀。最多返回前 200 行。"""
-
-    # 第一步：安全检查。跑出 workspace 就拒绝
-    full = _safe_path(path)
-    if full is None:
-        return "拒绝访问：路径超出工作目录"
-
-    # 第二步：读文件
-    # with 会自动关文件；try/except 保证"文件不存在"时返回提示而不是崩掉
+def _run_python(target, root):
+    inherited = {"PATH", "SYSTEMROOT", "WINDIR", "TEMP", "TMP", "TMPDIR"}
+    environment = {key: value for key, value in os.environ.items() if key.upper() in inherited}
     try:
-        with open(full, encoding="utf-8") as f:
-            lines = f.readlines()          # 列表，每个元素是一行（带 \n）
-    except FileNotFoundError:
-        return f"文件不存在：{path}"
-    except UnicodeDecodeError:
-        return f"读取失败：{path} 不是文本文件，或编码不支持"
-
-    # 第三步：截断
-    # 文件有 5 万行时，全塞进 messages 会把上下文撑爆
-    if len(lines) > MAX_READ_LINES:
-        body = "".join(lines[:MAX_READ_LINES])     # 列表 -> 字符串
-        return body + f"\n\n...（文件共 {len(lines)} 行，只显示前 {MAX_READ_LINES} 行）"
-
-    return "".join(lines)+ f"\n\n（共 {len(lines)} 行）"
-
-
-# ==============================================================================
-# 工具二：写文件
-# ==============================================================================
-
-
-@tool
-def write_file(path: str, content: str):
-    """把内容写入文件（会覆盖原内容）。
-    path 是【相对 workspace 的路径】，例如 "hello.py"。
-    不要写 "workspace/" 前缀。"""
-
-
-    full = _safe_path(path)
-    if full is None:
-        return "拒绝访问：路径超出工作目录"
-
-    try:
-        # 如果目标是 workspace\sub\a.txt，而 sub 目录不存在，先把它建出来
-        parent = os.path.dirname(full)
-        if parent and not os.path.exists(parent):
-            os.makedirs(parent, exist_ok=True)
-        
-        existed = os.path.exists(full)
-
-        # "w" = 写入模式，文件已存在会被清空
-        with open(full, "w", encoding="utf-8") as f:
-            f.write(content)
-        
-        size = len(content.encode("utf-8"))
-        suffix = "，已覆盖" if existed else ""
-        return f"已写入 {path}（{size} 字节{suffix}）"
-    except OSError as e:
-        # OSError 覆盖了权限不足、磁盘满、路径非法等各种文件系统错误
-        return f"写入失败：{e}"
-
-
-
-# ==============================================================================
-# 工具三：执行命令
-# ==============================================================================
-
-
-@tool
-def run_command(command: str):
-    """在 workspace 目录下执行一条命令，返回输出"""
-
-    # ★ 第一步：安全检查。危险命令直接拒绝，不进入 subprocess
-    hit = _check_command(command)
-    if hit:
-        log_event("command_blocked", command=command, pattern=hit)
-        return (
-            f"拒绝执行：这条命令包含危险操作（{hit}）。"
-            "它会破坏系统或数据，我无法执行。"
-            "如果你确实需要，请自己手动操作。"
-        )
-
-    try:
-        r = subprocess.run(
-            command,              # 要执行的命令，比如 "dir" 或 "python main.py"
-            shell=True,           # 让系统 shell 解释（dir / echo 是 shell 内建命令）
-            capture_output=True,  # 把输出抓回来，而不是直接打印到屏幕
-            timeout=TIMEOUT,      # 超时就杀掉，抛 TimeoutExpired
-            cwd=WORKSPACE,        # 在 workspace 里执行，不是在你的项目根目录
-            # 注意：这里不写 text=True 和 encoding —— 见 _decode 的注释
-        )
-    except subprocess.TimeoutExpired:
-        return f"命令执行超时（{TIMEOUT} 秒）：{command}"
-
-    # 拿到的是 bytes，自己解码
-    out = _decode(r.stdout)
-    err = _decode(r.stderr)
-
-    # returncode：0 = 成功，非 0 = 失败
-    if r.returncode == 0:
-        text = out or "(命令执行成功，但没有任何输出)"
-    else:
-        # 失败时优先看 stderr（错误信息），有些命令也会往 stdout 写错误
-        text = f"命令失败（返回码 {r.returncode}）\n{err or out}"
-
-    # 截断，防止 "dir C:\" 这种命令返回几千行
-    if len(text) > MAX_OUTPUT_CHARS:
-        text = text[:MAX_OUTPUT_CHARS] + f"\n\n...（输出过长，只显示前 {MAX_OUTPUT_CHARS} 字符）"
-
-    return text
+        with tempfile.TemporaryFile() as output:
+            process = subprocess.run(
+                [sys.executable, "-X", "utf8", "-u", str(target)],
+                cwd=root,
+                env=environment,
+                stdin=subprocess.DEVNULL,
+                stdout=output,
+                stderr=subprocess.STDOUT,
+                timeout=TIMEOUT_SECONDS,
+                check=False,
+            )
+            output.seek(0)
+            text = _bounded_read(output, MAX_OUTPUT_BYTES, "replace")
+    except subprocess.TimeoutExpired as exc:
+        raise ToolError(f"脚本超过 {TIMEOUT_SECONDS} 秒运行上限。") from exc
+    except OSError as exc:
+        raise ToolError("无法启动 Python 脚本。") from exc
+    if process.returncode:
+        raise ToolError(f"脚本退出码 {process.returncode}。\n{text}")
+    return text or "脚本执行完成，无输出。"

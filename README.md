@@ -1,236 +1,85 @@
-# MiniAgent —— 用纯 Python 手写的 Agent 内核
+# MiniAgent
 
-> 不依赖 LangChain / LangGraph / 任何 Agent 框架，从零实现 Function Calling 循环、工具注册、多实例隔离，并在这套内核上跑了两个完全不同的应用。
->
-> Python 3.11 · DeepSeek API · OpenAI SDK · **约 920 行，零框架依赖**
+一个用 Python 手写的工具调用 Agent，采用 ReAct 风格的「模型决策 → 工具执行 → 结果回传」循环。两个 CLI 应用复用同一套运行时，分别演示函数调用和工作区文件操作。
 
----
+核心只借助 OpenAI Python SDK 发起 DeepSeek 请求。工具 Schema、消息历史、工具校验与执行、调用结果配对、请求重试和日志由项目自己管理。
 
-## 为什么做这个
+## 从一条请求开始
 
-用框架搭 Agent 很容易，但说不清它内部怎么运转：
+假设你问「计算 (18 + 24) / 6，再告诉我现在几点」。
 
-- 模型是怎么"决定"要调工具的？
-- 工具执行完，结果怎么回到对话里？
-- 为什么两个 Agent 实例不会互相串记忆？
+1. CLI 把输入交给 Agent。Agent 将用户消息和工具说明一起发给模型。
+2. 模型可在同一个响应里请求 `calculate` 和 `get_time`。Agent 先检查响应是否完整，再按返回顺序逐个校验和执行。
+3. 每次调用都生成带原 `tool_call_id` 的结果。参数错了、工具不存在或执行失败也会回传对应结果。
+4. Agent 把调用和结果一并送回模型。拿到最终回答后先写入会话历史，再交给 CLI 显示。
 
-这个项目就是为了把这三件事**手写一遍**。写完之后再看 LangGraph，才知道它替你做了什么、代价是什么。
+终端会按顺序显示模型请求、工具名和执行状态。例如，同一轮调用两个工具时：
 
-**核心验证目标只有一条：**
-
-> **加第二个应用时，框架代码一行都不用改。**
-
-如果改了，说明抽象是错的。
-
----
-
-## 核心设计：框架与应用分离
-
-```
-┌─────────────────────────────────────────────────────────┐
-│  core/agent.py            【框架】                       │
-│  ─────────────────────────────────────────────────────  │
-│  · @tool 装饰器        把普通函数变成"工具说明书"          │
-│  · Agent 类            ReAct 循环 + 多实例状态            │
-│  · 不认识任何具体工具，只认识"有 _schema 属性的函数"        │
-└─────────────────────────────────────────────────────────┘
-                    ↑ 生产 _schema        ↓ 消费 _schema
-┌─────────────────────────────────────────────────────────┐
-│  apps/                    【应用】                       │
-│  ─────────────────────────────────────────────────────  │
-│  assistant.py        assistant 应用：查天气 / 算数 / 时间  │
-│  coding_agent.py     coding 应用：读写文件 / 执行命令      │
-└─────────────────────────────────────────────────────────┘
+```text
+[第 1 轮] 请求模型
+[第 1 轮] 模型请求工具 calculate
+[第 1 轮] calculate → 成功
+[第 1 轮] 模型请求工具 get_time
+[第 1 轮] get_time → 成功
+[第 2 轮] 请求模型
+Agent: …
 ```
 
-**关键约定：`@tool` 生产 `_schema`，`Agent` 消费 `_schema`。**
+进度由程序在运行时输出，只包含事件元数据。工具参数、返回正文和模型的内部推理不会出现在进度行里。
 
-两者是同一个约定的两端，**所以 `@tool` 必须属于框架，不能属于应用** —— 否则每个应用都要重新实现一遍。
+| 层 | 源码 | 职责 |
+| --- | --- | --- |
+| 入口 | [cli.py](MiniAgent/cli.py) | 配置、客户端、交互循环 |
+| 核心 | [agent.py](MiniAgent/core/agent.py) | 工具注册、请求循环、参数校验、调用结果与会话历史 |
+| 应用 | [assistant.py](MiniAgent/apps/assistant.py)、[coding_agent.py](MiniAgent/apps/coding_agent.py) | 演示工具、工作区工具与角色提示 |
+| 支撑 | [retry.py](MiniAgent/core/retry.py)、[logger.py](MiniAgent/core/logger.py) | 瞬时请求重试、JSONL 事件 |
+| 验证 | [selftest.py](MiniAgent/selftest.py) | 工具和消息协议的离线回归测试 |
 
-### 这套抽象成立的证据
+## 安装与离线自测
 
-| 应用 | 工具数 | 需要改 `core/agent.py` 吗 |
-|---|---|---|
-| assistant | 4 | — |
-| coding_agent | 3（含路径沙箱、命令执行） | **一行未改** |
+需要 Python **3.11+**。以下命令从仓库根目录运行。
 
-添加 `coding_agent` 时，只做了两件事：写工具函数加 `@tool`、把它加进 `Agent(tools=[...])`。
-
----
-
-## 目录结构
-
-```
-.
-├── MiniAgent/
-│   ├── core/                    ← 框架（不含任何具体工具）
-│   │   ├── agent.py      179 行   ReAct 循环 + 多实例状态
-│   │   ├── retry.py       68 行   指数退避重试
-│   │   └── logger.py      47 行   结构化日志（JSONL）
-│   │
-│   ├── apps/                    ← 应用
-│   │   ├── assistant.py   49 行   4 个工具 + SYSTEM_PROMPT
-│   │   └── coding_agent.py 262 行  3 个工具 + 路径沙箱 + 命令拦截
-│   │
-│   ├── workspace/               ← Coding Agent 的沙箱目录（gitignore）
-│   ├── logs/                    ← 运行日志（gitignore）
-│   ├── main.py            15 行   assistant 入口
-│   ├── main_coding.py     15 行   coding agent 入口
-│   └── selftest.py       282 行   37 项自动化自检
-│
-└── hello_agent.py              ← v1：单文件版本，保留作为演进记录
+```powershell
+python -m venv .venv
+.\.venv\Scripts\python.exe -m pip install -r requirements.txt
+.\.venv\Scripts\python.exe MiniAgent/selftest.py
 ```
 
----
+macOS / Linux 将 Python 路径换成 `./.venv/bin/python`。自测无需 API Key，使用临时目录、预设响应和本地模拟 HTTP。覆盖同轮多工具、截断响应、工具执行中断、文件覆盖确认和本地脚本超时等行为。系统禁止创建符号链接时，对应用例会标记为跳过。
 
-## 快速开始
+## 运行两个应用
 
-**1. 配置 API Key**
+先复制配置模板，把自己的 DeepSeek Key 填进 `.env`。默认模型为 `deepseek-flash`，CLI 显式使用非思考模式，聚焦基本工具调用协议。可以通过 `MINIAGENT_MODEL` 指定其他支持这种调用方式的 DeepSeek 模型。 [DeepSeek 工具调用文档](https://api-docs.deepseek.com/guides/tool_calls/)
 
-在项目根目录建 `.env`：
+```powershell
+if (-not (Test-Path .env)) { Copy-Item .env.example .env }
 
-```
-DEEPSEEK_API_KEY=sk-xxxxxxxx
-```
+# 演示助手
+.\.venv\Scripts\python.exe MiniAgent/main.py
 
-**2. 进入项目目录**
-
-```bash
-cd MiniAgent
+# 编程助手，使用默认工作区 MiniAgent/workspace
+.\.venv\Scripts\python.exe MiniAgent/main_coding.py
 ```
 
-> ⚠️ 必须在 `MiniAgent/` 下运行，否则 `from core.agent import ...` 会失败。
-> 因为 Python 找模块是看**当前目录**的。
+演示助手支持算术、本机时间、天气与股票样例。天气和股票结果是固定演示数据。可以试「计算 (18 + 24) / 6，再告诉我现在几点」，然后追问「刚才的计算结果是多少」。
 
-**3. 运行**
+编程助手可试「在工作区新建 hello.txt，写入 hello MiniAgent，然后读回文件」。接着请求替换该文件，终端会列出目标路径，输入 `yes` 才批准覆盖。可用 `--workspace` 指定一个已有目录。两个入口都可用 `--help` 查看参数，输入 `q` 结束当前会话。
 
-```bash
-# 方式一：已激活虚拟环境
-python main.py
-
-# 方式二：直接用 venv 里的解释器（Windows，未激活环境时）
-..\.venv\Scripts\python.exe main.py
+```powershell
+.\.venv\Scripts\python.exe MiniAgent/main_coding.py --enable-python
 ```
 
-**三个入口：**
+## 执行边界
 
-```bash
-# 日常助手（查天气 / 算数 / 时间 / 股票）
-main.py
+- 默认注册 `list_files`、`read_file`、`write_file`。文件工具限制在选定工作区，文本读写各有 16 KiB 上限，目录列表最多 100 项。覆盖需要模型传入 `overwrite=true`，并由用户在终端确认。批准后会再次检查目标路径和文件状态。
+- Python 执行默认关闭。启用后只接收工作区内现有的 `.py` 文件，每次都在终端确认，文件在确认期间变动时会拒绝启动。脚本以当前用户权限运行，请只批准自己检查过的脚本。对子进程的等待上限为 15 秒，返回至多 4 KiB 的输出正文。
+- 每条输入默认最多发起 5 轮逻辑模型请求。连接错误、HTTP 429 和 5xx 最多额外重试两次，只重试请求。模型输出被截断时不会执行其中的工具。工具批次被中断时，会保留已完成的结果、补齐调用 ID，并区分状态未知和未执行的动作。已执行动作的副作用需要检查实际文件或输出。
+- 日志写在 `MiniAgent/logs`，以 `turn_id` 和 `tool_call_id` 串起事件。应用日志仅记录元数据，当前会话文本和工具结果放在内存，并作为请求上下文发给模型。退出后会话历史清空。
 
-# Coding Agent（读写文件 / 执行命令）
-main_coding.py
+## 复习与后续扩展
 
-# 自检（37 项，全绿才算环境正常）
-selftest.py
-```
+- [复习与面试手册](docs/MiniAgent_完全手册_复习与面试版.md) 按架构、核心、工具和测试组织，有 144 道分档练习。
+- [带侧栏的阅读版](docs/MiniAgent_目录阅读版.html) 可在本地浏览器打开，有模块导航、题库和每日复习记录。
+- 十项扩展中，集中工具执行已完成。后续规划为权限、局部编辑、计划模式、任务清单、会话持久化、请求追踪、上下文压缩、长期记忆与 MCP。手册第 13 章给出了各项验收点。
 
----
-
-## 已经验证过的能力
-
-| 能力 | 实现 | 验证方式 |
-|---|---|---|
-| **Function Calling 循环** | 模型返回 `tool_calls` → 执行 → 结果回喂 → 再问 | 真实对话 |
-| **工具自动注册** | `@tool` 读函数签名生成 JSON Schema | 检查 `required` 字段 |
-| **多实例状态隔离** | 状态存在 `self.messages`，不是全局变量 | 两个 Agent 记忆互不污染 |
-| **并发工具调用** | `for tool_call in msg.tool_calls`（不是 `[0]`） | 一轮返回 2 个 `write_file` 并全部执行 |
-| **指数退避重试** | 只重试网络 / 429 / 5xx，客户端错误立刻抛 | 单元测试 5 项 |
-| **结构化日志** | JSONL，5 种事件类型，写失败不影响主流程 | 读回解析验证 |
-| **路径沙箱** | `abspath + startswith(WORKSPACE + os.sep)` | `../../.env` 被拒绝 |
-| **危险命令拦截** | 黑名单 + 归一化（挡 `DEL /S`、`del/s` 变体） | 单元测试 5 项 |
-| **37 项自动化自检** | 覆盖读/写/执行/安全/重试/日志 | `selftest.py` 全绿 |
-
----
-
-## 一个真实运行记录
-
-**任务**：`帮我在 workspace 里创建 hello.py，打印 1 到 10 的平方，然后运行它`
-
-```
---- 第 1 轮 ---
-  模型要调工具: write_file({'path': 'hello.py', 'content': 'for i in range(1, 11):...'})
-  工具返回: 已写入 hello.py（62 字节）
-
---- 第 2 轮 ---
-  模型要调工具: run_command({'command': 'python3 hello.py'})
-  工具返回: 命令失败（返回码 9009）          ← Windows 没有 python3
-
---- 第 3 轮 ---
-  模型要调工具: run_command({'command': 'python hello.py'})
-  工具返回: 1 的平方是 1 / 2 的平方是 4 / ... / 10 的平方是 100
-
---- 第 4 轮 ---
-  最终回答: 完成。另外说明：本环境中 python3 不可用，需要用 python 运行。
-```
-
-**注意第 2→3 轮**：代码里**没有任何"python3 失败就换 python"的逻辑**。
-模型看到返回码 9009，自己判断是"命令不存在"，换了写法重试。
-
-**这就是 ReAct 里 Observation 的价值：失败不是终点，是一条新信息。**
-
-> 后来为了不再浪费这一轮，我在 `SYSTEM_PROMPT` 里注入了一段「运行环境」说明
-> （Windows / cmd / Python 命令是 `python`），直接把 4 轮降到 3 轮。
-
----
-
-## 设计取舍（我刻意没做的事）
-
-**这一节比上面所有功能都重要 —— 因为它说明我知道边界在哪。**
-
-| 没做 | 为什么 |
-|---|---|
-| **容器沙箱** | 危险命令黑名单只是"减速带"，不是"墙"。只要模型能调 `python`，就能用 `shutil.rmtree` 绕过关键词检查。真正的方案是 Docker + 只读挂载，但部署复杂度对学习项目不划算。 |
-| **上下文压缩** | `messages` 只增不减，聊久了会串台甚至超上限。**这是已知缺陷**，压缩方案在后续计划里。 |
-| **流式输出** | 命令行场景收益低，等有 Web 界面时再做。 |
-| **MCP 协议** | 想做，但它属于"扩展能力"，优先级低于可靠性。 |
-| **子 Agent / 多 Agent** | 这个项目的定位是"单 Agent 内核"，多 Agent 编排放在主项目里做。 |
-| **登录 / 用户系统** | 演示项目不需要，用 `user_id` 参数代替反而更清晰。 |
-
----
-
-## 已知问题
-
-1. **`self.messages` 无限增长** —— 聊 30 轮以上会开始重复前面内容，100 轮会超上下文上限。
-2. **黑名单可被绕过** —— 见上表。已实测：`python -c "import shutil; shutil.rmtree(...)"` 能穿过。
-3. **工具串行执行** —— 模型一次返回多个 `tool_calls` 时，是顺序执行的，没有并发。
-4. **没有重试降级** —— 重试 3 次都失败后，异常直接抛到入口，用户看到的是堆栈。
-
----
-
-## 后续计划
-
-围绕「Agent 可靠性四问」补齐能力：
-
-| 问题 | 计划 |
-|---|---|
-| 状态为什么会漂移 | 任务清单（task_create / update）+ Plan Mode |
-| 工具为什么不会乱调 | 权限系统（白名单 + 默认拒绝）+ auto 模式分类器 |
-| 上下文为什么越来越乱 | 上下文压缩（摘要 + 恢复最近文件）+ 分层记忆 |
-| 断了怎么恢复 | Checkpoint 持久化 |
-
-外加两个能力扩展：精确编辑（`edit_file`，search/replace 而不是整文件重写）、MCP 客户端。
-
----
-
-## 技术栈
-
-```
-Python 3.11
-OpenAI SDK        ← 只用了最基础的 chat.completions，没有用 Responses API
-DeepSeek API      ← 兼容 OpenAI 协议，改 base_url 即可
-python-dotenv     ← 读 .env
-```
-
-**没有 LangChain，没有 LangGraph，没有任何 Agent 编排库。**
-
----
-
-## 演进记录
-
-| 版本 | 内容 |
-|---|---|
-| v1 | `hello_agent.py`：单文件 301 行，跑通 ReAct 循环 |
-| v2 | 状态从全局变量收进 `Agent` 类，多实例记忆隔离 |
-| v3 | 拆成 `core/` + `apps/`，加第二个应用，框架零改动 |
-| v4 | 加固：重试、日志、路径沙箱、命令拦截、37 项自检 |
+`.env` 保存本地配置，`.venv/` 安装依赖，`MiniAgent/workspace/` 存工作文件，`MiniAgent/logs/` 存运行事件。这些路径和 Python 的 `__pycache__/` 都由 Git 忽略。换电脑时用仓库里的 `.env.example` 和 `requirements.txt` 重建配置与环境。

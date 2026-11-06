@@ -1,50 +1,74 @@
+"""Small demonstration tools for the same Agent runtime."""
+
+import ast
 import datetime
-from core.agent import tool
+import math
+import operator
+
+from core.agent import ToolError, tool
+
 SYSTEM_PROMPT = (
-    "你是一个有用的助手。需要查天气、算数或查股票价格时，"
-    "必须调用工具，不许自己编答案。"
+    "你是一个演示助手。算数、查时间、天气或股票时使用对应工具。"
+    "天气和股票工具返回固定演示数据，请向用户说明。"
 )
 
-# ==============================================================================
-# ① 工具函数：真正干活的 Python 代码
-# ==============================================================================
-#
-# 这些就是普通函数，没有任何魔法。模型不会直接执行它们——
-# 是【我们的代码】执行它们，然后把结果告诉模型。这点必须先想清楚。
-@tool
-def get_weather(city: str):
-    """查询城市天气"""
-    # 这是个字典 dict：用 "键" 找 "值"，类似 Java 的 Map
-    data = {
-        "北京": "晴，26度，微风",
-        "上海": "多云，30度，湿度大",
-        "杭州": "小雨，24度，记得带伞",
-    }
-    # .get(键, 默认值)：找不到这个城市时返回默认值，不会报错
-    # f"..." 是 f-string，把变量 {city} 直接嵌进字符串
-    return data.get(city, f"{city}：暂无数据")
+_BINARY = {
+    ast.Add: operator.add,
+    ast.Sub: operator.sub,
+    ast.Mult: operator.mul,
+    ast.Div: operator.truediv,
+    ast.FloorDiv: operator.floordiv,
+    ast.Mod: operator.mod,
+}
+_UNARY = {ast.UAdd: operator.pos, ast.USub: operator.neg}
+_MAX_NUMBER = 10 ** 12
+
+
+def _arithmetic(node):
+    if isinstance(node, ast.Constant) and type(node.value) in (int, float):
+        result = node.value
+    elif isinstance(node, ast.BinOp) and type(node.op) in _BINARY:
+        result = _BINARY[type(node.op)](_arithmetic(node.left), _arithmetic(node.right))
+    elif isinstance(node, ast.UnaryOp) and type(node.op) in _UNARY:
+        result = _UNARY[type(node.op)](_arithmetic(node.operand))
+    else:
+        raise ToolError("仅支持数字、括号和 + - * / // % 运算。")
+    if abs(result) > _MAX_NUMBER or not math.isfinite(result):
+        raise ToolError("数值超出计算范围。")
+    return result
+
 
 @tool
 def calculate(expression: str):
-    """计算数学表达式"""
-    # try/except 是"出错也不崩"的写法：
-    #   try    里出错 → 跳到 except，而不是让整个程序挂掉
-    # 为什么必须包一层？因为用户可能输入 "hello"，eval 会炸，
-    # 不捕获的话 Agent 直接崩溃退出
+    """计算长度不超过 128 字符的算术表达式，支持 + - * / // %。"""
+    if len(expression) > 128:
+        raise ToolError("表达式过长。")
     try:
-        # eval("1+1") 会把字符串当代码执行，返回结果
-        # ⚠️ 真实项目绝对不能用 eval——用户可以输入删库命令。
-        #    这里只是学习演示。生产环境要用专门的数学解析库。
-        return str(eval(expression))   # 必须转成字符串！下面会解释为什么
-    except Exception as e:
-        return f"算错了：{e}"
+        tree = ast.parse(expression.strip(), mode="eval")
+        return str(_arithmetic(tree.body))
+    except SyntaxError as exc:
+        raise ToolError("算术表达式格式不正确。") from exc
+    except ZeroDivisionError as exc:
+        raise ToolError("除数不能为零。") from exc
+
+
+@tool
+def get_weather(city: str):
+    """读取城市的固定天气样例。"""
+    data = {"北京": "晴，26 度", "上海": "多云，30 度", "杭州": "小雨，24 度"}
+    return f"演示数据：{city}，{data.get(city, '暂无数据')}"
+
 
 @tool
 def get_time():
-    """返回当前时间"""
-    return datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    """返回本机时间和时区偏移。"""
+    return datetime.datetime.now().astimezone().isoformat(timespec="seconds")
+
 
 @tool
 def get_stock_price(code: str):
-    """查询股票价格"""
-    return f"{code}：100元"
+    """返回证券代码的固定价格样例。"""
+    return f"演示数据：{code}，100 元"
+
+
+TOOLS = [get_weather, calculate, get_time, get_stock_price]

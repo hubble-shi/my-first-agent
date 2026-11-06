@@ -1,180 +1,252 @@
-import os                          # 用来读环境变量（API Key 存在系统环境里）
-import json                        # 模型返回的工具参数是 JSON 字符串，要解析成 Python 字典
-from openai import OpenAI          # OpenAI 官方库。DeepSeek 兼容它的格式，所以直接复用
-from dotenv import load_dotenv     # 用来读取 .env 文件里的配置
-import inspect                     # 用来读取函数的参数结构（装饰器里要用）
-from core.retry import call_with_retry
-from core.logger import log_event
+"""Handwritten model/tool loop. Importing this module does not create a client."""
 
-load_dotenv()
+import inspect
+import json
+import math
+from typing import get_type_hints
+from uuid import uuid4
 
-# 创建客户端：相当于"拨号连接"到 DeepSeek 的服务器
-# base_url 是关键——OpenAI 的库默认连 api.openai.com，
-# 这里我们改成 DeepSeek 的地址，就变成调 DeepSeek 了
-client = OpenAI(
-    api_key=os.getenv("DEEPSEEK_API_KEY"),
-    base_url="https://api.deepseek.com",
-)
-#1"https://api.deepseek.com"
-TYPE_MAP = {
-    str: "string",
-    int: "integer",
-    float: "number",
-    bool: "boolean",
-}
+from .logger import log_event
+from .retry import call_with_retry
 
+_TYPE_MAP = {str: "string", int: "integer", float: "number", bool: "boolean"}
+
+
+class ToolError(Exception):
+    """An expected tool failure whose message is safe to return to the model."""
+
+
+class ModelResponseError(Exception):
+    """The model did not return a usable assistant message."""
 
 
 def tool(func):
-    """把一个函数注册成 Agent 可用的工具"""
-    name = func.__name__
-    description = func.__doc__ or ""
-
-    sig = inspect.signature(func)
+    """Describe an ordinary function with a small, checked JSON Schema."""
+    signature = inspect.signature(func)
+    hints = get_type_hints(func)
     properties = {}
     required = []
 
-    for param_name, param in sig.parameters.items():
-        json_type = TYPE_MAP.get(param.annotation, "string")
-        properties[param_name] = {"type": json_type}
-        if param.default is inspect.Parameter.empty:
-            required.append(param_name)
+    for name, parameter in signature.parameters.items():
+        if parameter.kind not in (
+            inspect.Parameter.POSITIONAL_OR_KEYWORD,
+            inspect.Parameter.KEYWORD_ONLY,
+        ):
+            raise TypeError(f"{func.__name__}.{name} must accept a keyword argument")
+        annotation = hints.get(name)
+        if annotation not in _TYPE_MAP:
+            raise TypeError(f"{func.__name__}.{name} must be str, int, float or bool")
+        properties[name] = {"type": _TYPE_MAP[annotation]}
+        if parameter.default is inspect.Parameter.empty:
+            required.append(name)
 
-    # ★ 关键变化：不再往全局列表里塞，而是挂在函数自己身上
-    #   函数是对象，可以像这样给它加属性
     func._schema = {
         "type": "function",
         "function": {
-            "name": name,
-            "description": description,
+            "name": func.__name__,
+            "description": inspect.getdoc(func) or "",
             "parameters": {
                 "type": "object",
                 "properties": properties,
                 "required": required,
+                "additionalProperties": False,
             },
         },
     }
-
-
     return func
 
+
+def _matches_type(value, kind):
+    if kind == "number":
+        return type(value) is int or (type(value) is float and math.isfinite(value))
+    return type(value) is {"string": str, "integer": int, "boolean": bool}[kind]
+
+
+def _unique_json_object(pairs):
+    result = {}
+    for key, value in pairs:
+        if key in result:
+            raise ToolError("工具参数包含重复的 JSON 键。")
+        result[key] = value
+    return result
+
+
+def _assistant_message(response):
+    choices = getattr(response, "choices", None)
+    if not isinstance(choices, (list, tuple)) or not choices:
+        raise ModelResponseError("模型返回了空响应或无法识别的候选列表。")
+    choice = choices[0]
+    reason = getattr(choice, "finish_reason", None)
+    if reason == "length":
+        raise ModelResponseError("本轮模型输出被截断，请缩小任务后重试。")
+    if reason not in ("stop", "tool_calls"):
+        raise ModelResponseError("模型未正常完成本轮响应，请重试。")
+
+    message = getattr(choice, "message", None)
+    if message is None:
+        raise ModelResponseError("模型返回了空响应。")
+    content = getattr(message, "content", None)
+    raw_calls = getattr(message, "tool_calls", None)
+    if content is not None and not isinstance(content, str):
+        raise ModelResponseError("模型返回了不支持的消息正文。")
+    if raw_calls is not None and not isinstance(raw_calls, (list, tuple)):
+        raise ModelResponseError("模型返回了不支持的工具调用格式。")
+    if bool(raw_calls) != (reason == "tool_calls"):
+        raise ModelResponseError("模型结束状态与工具调用不一致。")
+
+    assistant = {"role": "assistant", "content": content}
+    calls = []
+    call_ids = set()
+    for call in raw_calls or ():
+        call_id = getattr(call, "id", None)
+        if (
+            getattr(call, "type", None) != "function" or not isinstance(call_id, str)
+            or not call_id or call_id in call_ids
+        ):
+            raise ModelResponseError("模型返回了无法配对的工具调用。")
+        function = getattr(call, "function", None)
+        name = getattr(function, "name", None)
+        arguments = getattr(function, "arguments", None)
+        if not isinstance(name, str) or not name or not isinstance(arguments, str):
+            raise ModelResponseError("模型返回了不支持的工具调用格式。")
+        call_ids.add(call_id)
+        calls.append({
+            "id": call_id,
+            "type": "function",
+            "function": {"name": name, "arguments": arguments},
+        })
+    if calls:
+        assistant["tool_calls"] = calls
+    elif not content or not content.strip():
+        raise ModelResponseError("模型没有给出文本回答或工具调用。")
+    return assistant
+
+
 class Agent:
-    """一个 Agent 实例：有自己的行为准则、自己的对话记忆"""
-
-    def __init__(self, tools, system_prompt, max_turns=5):
-        """
-    __init__ 在【创建对象】时自动执行一次，负责装上初始状态。
-
-    tools          —— 这个 Agent 能用的工具列表
-    system_prompt  —— 这个 Agent 的角色（必填：框架不知道该给你什么角色）
-    max_turns      —— 最多循环几轮
-    """
-
-
-
-        self.system_prompt = system_prompt
+    def __init__(self, tools, system_prompt, max_turns=5, *, complete, model, on_event=None):
+        if type(max_turns) is not int or max_turns < 1:
+            raise ValueError("max_turns must be a positive integer")
+        self.complete = complete
+        self.model = model
+        self.on_event = on_event
         self.max_turns = max_turns
-
-        # ★ 这个 Agent 自己的工具（两样东西，各有用处）
-        #   self.tools   : 名字 -> 函数，执行工具时用
-        #   self.schemas : 说明书列表，发给模型看
         self.tools = {}
         self.schemas = []
-        for f in tools:
-            self.tools[f.__name__] = f
-            self.schemas.append(f._schema)
+        self.messages = [{"role": "system", "content": system_prompt}]
 
-        # ★ 关键：每个 Agent 自己的记忆，从 system 那条开始
-        #   注意是 self.messages，不是以前那个全局的 MESSAGES
-        self.messages = [
-            {"role": "system", "content": self.system_prompt},
-        ]
+        for func in tools:
+            if not hasattr(func, "_schema"):
+                raise TypeError(f"{func.__name__} must be registered with @tool")
+            if func.__name__ in self.tools:
+                raise ValueError(f"Duplicate tool: {func.__name__}")
+            self.tools[func.__name__] = func
+            self.schemas.append(func._schema)
+
+    def _report_event(self, event, **fields):
+        log_event(event, **fields)
+        if self.on_event is not None:
+            try:
+                self.on_event(event, **fields)
+            except Exception as exc:
+                log_event("event_report_failed", turn_id=fields["turn_id"], error_type=type(exc).__name__)
+
+    def execute_tool(self, call, *, turn_id, round_number):
+        """Validate, execute and return one result with the original call ID."""
+        name = call["function"]["name"]
+        call_id = call["id"]
+        self._report_event("tool_call", turn_id=turn_id, round=round_number, tool=name, tool_call_id=call_id)
+        status = "ok"
+
+        try:
+            func = self.tools.get(name)
+            if func is None:
+                raise ToolError("未知工具。请从已注册的工具中选择。")
+
+            try:
+                args = json.loads(call["function"]["arguments"], object_pairs_hook=_unique_json_object)
+            except (ValueError, RecursionError) as exc:
+                raise ToolError("工具参数不是有效的 JSON。") from exc
+            if not isinstance(args, dict):
+                raise ToolError("工具参数必须是 JSON 对象。")
+
+            parameters = func._schema["function"]["parameters"]
+            for key, value in args.items():
+                if key not in parameters["properties"]:
+                    raise ToolError("包含未知参数。请核对工具参数说明。")
+                kind = parameters["properties"][key]["type"]
+                if not _matches_type(value, kind):
+                    raise ToolError(f"参数 {key} 应为 {kind}。")
+            if any(key not in args for key in parameters["required"]):
+                raise ToolError("缺少必填参数。请核对工具参数说明。")
+
+            result = str(func(**args))
+        except ToolError as exc:
+            status = "rejected"
+            result = f"工具失败：{exc}"
+        except Exception as exc:
+            status = "error"
+            result = f"工具执行失败（{type(exc).__name__}）。"
+
+        self._report_event(
+            "tool_result", turn_id=turn_id, round=round_number, tool=name,
+            tool_call_id=call_id, status=status,
+        )
+        return {"role": "tool", "tool_call_id": call_id, "content": result}
+
+    def _append_tool_batch(self, assistant, *, turn_id, round_number):
+        calls = assistant["tool_calls"]
+        first_result = len(self.messages) + 1
+        try:
+            self.messages.append(assistant)
+            for call in calls:
+                self.messages.append(
+                    self.execute_tool(call, turn_id=turn_id, round_number=round_number)
+                )
+        except KeyboardInterrupt:
+            # Keep completed results. Never run or replay a tool to repair history.
+            if len(self.messages) < first_result:
+                raise
+            remaining = calls[len(self.messages) - first_result:]
+            for index, call in enumerate(remaining):
+                content = "工具未执行：用户中断了本轮。"
+                if index == 0:
+                    content = "工具被中断，完成状态未知，请检查实际结果。"
+                self.messages.append({
+                    "role": "tool", "tool_call_id": call["id"], "content": content,
+                })
+            self._report_event("turn_interrupted", turn_id=turn_id, round=round_number)
+            raise
 
     def run(self, user_input):
-        """
-        处理一次用户提问，返回最终答案。
-
-        self.messages 是整个对话历史。每一轮都把新消息 append 进去，
-        模型每次看到的都是【完整历史】，所以它才有"记忆"。
-        """
-        # 四个角色：
-        #   system    —— 设定模型的行为准则（最高优先级）
-        #   user      —— 用户说的话
-        #   assistant —— 模型说的话
-        #   tool      —— 工具的执行结果（下面会遇到）
-        #
-        # ⚠️ 往【自己这个对象】的记忆里追加，不是往全局变量里
+        """Run one user turn. Tool requests and their results remain adjacent."""
+        turn_id = uuid4().hex
         self.messages.append({"role": "user", "content": user_input})
-        log_event("user_input", content=user_input)
+        log_event("user_input", turn_id=turn_id)
 
-
-        # self.max_turns = 最多循环几轮
-        # 为什么要有上限？
-        #   1. 防止死循环（模型可能一直调工具不收敛）
-        #   2. 控制成本（每一轮都要花钱 + 花时间）
-        # 真实项目里一般设 5-10 轮，并加上超时和 token 预算
-        for turn in range(self.max_turns):
-            print(f"\n--- 第 {turn + 1} 轮 ---")
-
-            response = call_with_retry(
-                lambda: client.chat.completions.create(
-                    model="deepseek-chat",
-                    messages=self.messages,
-                    tools=self.schemas,
+        for round_number in range(1, self.max_turns + 1):
+            request = {"model": self.model, "messages": self.messages}
+            if self.schemas:
+                request["tools"] = self.schemas
+            try:
+                self._report_event("model_request", turn_id=turn_id, round=round_number)
+                response = call_with_retry(lambda: self.complete(**request))
+                assistant = _assistant_message(response)
+            except (Exception, KeyboardInterrupt) as exc:
+                if round_number == 1:
+                    self.messages.pop()
+                log_event(
+                    "request_failed", turn_id=turn_id, round=round_number,
+                    error_type=type(exc).__name__,
                 )
-            )
+                raise
 
-            # response 是个大对象，真正的回复藏在 choices[0].message 里
-            msg = response.choices[0].message
-
-            # ---- 分支 A：模型说"我要调工具" ---------------------------------
-            # msg.tool_calls 是模型返回的调用请求列表。
-            # ⚠️ 是列表！模型可能一次要调多个工具（比如同时查北京和上海）。
-            #    所以必须用 for 遍历，不能只取 [0]，否则会丢数据。
-            if msg.tool_calls:
-                # 先把"模型想调工具"这个意图也存进历史。
-                # 不存的话，后面塞工具结果时模型会对不上号、直接报错。
-                self.messages.append(msg)
-
-                for tool_call in msg.tool_calls:
-                    name = tool_call.function.name       # 字符串，如 "get_weather"
-
-                    # 模型返回的参数是 JSON 字符串：'{"city": "杭州"}'
-                    # json.loads 把它转成 Python 字典：{"city": "杭州"}
-                    args = json.loads(tool_call.function.arguments)
-                    print(f"  模型要调工具: {name}({args})")
-                    log_event("tool_call", tool=name, args=args)
-
-                    # 【关键行】**args 里的 ** 是"字典解包"
-                    #   args = {"city": "杭州"}
-                    #   get_weather(**args)  等价于  get_weather(city="杭州")
-                    # 去掉 ** 就变成传一整个字典当第一个参数，会报错。
-                    result = self.tools[name](**args)      # 按名字找到函数并执行
-                    print(f"  工具返回: {result}")
-                    log_event("tool_result", tool=name, result=str(result))
-
-                    # 把工具结果塞回对话历史，让模型在下一轮能看到
-                    self.messages.append({
-                        "role": "tool",                  # 角色是 tool，不是 user
-                        "tool_call_id": tool_call.id,    # 告诉模型：这是你刚才那次调用的结果
-                        "content": result,               # 必须是字符串！所以上面 calculate 用了 str()
-                    })
-                    # tool_call_id 为什么必须带？
-                    #   一次请求可能有多个调用，模型要靠这个 ID 把结果和调用对上号。
-                    #   少了它，模型会困惑"这结果是谁的"，然后开始瞎编。
-
-                # continue = 立刻回到循环开头，再问一次模型
-                # 为什么必须 continue？
-                #   没有这行的话，代码会继续往下走到 return msg.content，
-                #   而此时 msg.content 是空的（模型在等工具结果），直接返回 None。
+            if "tool_calls" in assistant:
+                self._append_tool_batch(assistant, turn_id=turn_id, round_number=round_number)
                 continue
 
-            # ---- 分支 B：模型给出了最终答案 ---------------------------------
-            # 走到这里说明 msg.tool_calls 是空的，模型认为信息够了，可以直接回答
-            print(f"\n最终回答: {msg.content}")
-            log_event("final_answer", content=str(msg.content))
-            return msg.content
+            self.messages.append(assistant)
+            log_event("final_answer", turn_id=turn_id, round=round_number)
+            return assistant["content"]
 
-        # 循环跑满还没返回，说明模型卡住了
-        log_event("max_turns_exceeded", max_turns=self.max_turns)
-        return f"超过最大轮数了（{self.max_turns} 轮）"
+        log_event("max_turns_exceeded", turn_id=turn_id)
+        return f"已达到 {self.max_turns} 轮模型请求上限。请检查已经完成的工具操作。"
