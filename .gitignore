@@ -18,3 +18,6 @@ __pycache__/
 
 MiniAgent/workspace/
 MiniAgent/logs/
+
+# 本地复习资料
+/docs/
